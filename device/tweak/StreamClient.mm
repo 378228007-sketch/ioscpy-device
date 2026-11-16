@@ -53,6 +53,8 @@ static uint64_t clipHash(NSString *t) {
     IOSPYH264Encoder *_encoder;    // created lazily on the capture queue
     uint8_t _codec;                // 0 = MJPEG, 1 = H.264 (host's request)
     BOOL _needKeyframe;            // force an H.264 keyframe on the next frame
+    BOOL _encodeBusy;              // a submitted frame hasn't come back yet
+    BOOL _encodeFailed;            // encoder hard-failed; stay on MJPEG
 }
 
 + (instancetype)shared {
@@ -292,6 +294,8 @@ static uint64_t clipHash(NSString *t) {
     __weak typeof(self) weakSelf = self;
     dispatch_source_set_event_handler(_timer, ^{ [weakSelf captureAndSend]; });
     dispatch_resume(_timer);
+    _encodeBusy = NO;
+    _encodeFailed = NO;
     NSLog(@"[ioscpyhook] capture started");
 }
 
@@ -302,6 +306,7 @@ static uint64_t clipHash(NSString *t) {
         NSLog(@"[ioscpyhook] capture stopped");
     }
     // Release the encoder's hardware session while idle; it lazily rebuilds.
+    _encodeBusy = NO;
     [_encoder invalidate];
 }
 
@@ -360,11 +365,17 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
 }
 
 - (BOOL)captureAndSendH264:(int)fd {
-    if (!IOSPYH264Available()) {
+    if (!IOSPYH264Available() || _encodeFailed) {
         return NO;
     }
     if (!_encoder) {
         _encoder = [[IOSPYH264Encoder alloc] init];
+    }
+    if (_encodeBusy) {
+        // The previous frame hasn't come back from VideoToolbox yet. Dropping this
+        // tick keeps exactly one frame in flight instead of stacking a queue in
+        // front of the encoder.
+        return YES;
     }
     int width = 0, height = 0;
     IOSurfaceRef surface = IOSPYCaptureScreenSurface(kMaxDimension, &width, &height);
@@ -375,28 +386,45 @@ static NSData *makeVideoFrame(int width, int height, uint32_t flags, NSData *dat
     if (fps < 1) {
         fps = 1;
     }
-    BOOL isKey = NO;
-    NSData *avcc = [_encoder encodeSurface:surface
-                                     width:width
-                                    height:height
-                                       fps:fps
-                             forceKeyframe:_needKeyframe
-                                  keyframe:&isKey];
-    if (!avcc) {
-        return NO; // hard failure, fall back to MJPEG
-    }
-    if (avcc.length == 0) {
-        return YES; // dropped this tick, encoder still healthy
-    }
-    if (isKey) {
-        _needKeyframe = NO;
-    }
-    uint32_t flags = IOSPY_VIDEO_FLAG_H264 | orientationFlags();
-    if (isKey) {
-        flags |= IOSPY_VIDEO_FLAG_KEYFRAME | IOSPY_VIDEO_FLAG_CONFIG;
-    }
-    IOSPYWriteFrame(fd, IOSPYMsgVideoFrame, IOSPY_CHANNEL_VIDEO, 0,
-                    makeVideoFrame(width, height, flags, avcc));
+    BOOL forceKey = _needKeyframe;
+    _encodeBusy = YES;
+    dispatch_queue_t queue = _captureQueue;
+    __weak typeof(self) weakSelf = self;
+    [_encoder encodeSurface:surface
+                       width:width
+                      height:height
+                         fps:fps
+               forceKeyframe:forceKey
+                  completion:^(NSData *avcc, BOOL isKey, BOOL failed) {
+        dispatch_async(queue, ^{
+            typeof(self) self_ = weakSelf;
+            if (!self_) {
+                return;
+            }
+            self_->_encodeBusy = NO;
+            if (failed) {
+                self_->_encodeFailed = YES;
+                NSLog(@"[ioscpyhook] H.264 encode failed; dropping to MJPEG");
+                return;
+            }
+            if (isKey) {
+                self_->_needKeyframe = NO;
+            }
+            if (avcc.length == 0) {
+                return; // dropped this tick, encoder still healthy
+            }
+            int fdNow = self_->_fd;
+            if (fdNow < 0) {
+                return; // connection closed while the frame was encoding
+            }
+            uint32_t flags = IOSPY_VIDEO_FLAG_H264 | orientationFlags();
+            if (isKey) {
+                flags |= IOSPY_VIDEO_FLAG_KEYFRAME | IOSPY_VIDEO_FLAG_CONFIG;
+            }
+            IOSPYWriteFrame(fdNow, IOSPYMsgVideoFrame, IOSPY_CHANNEL_VIDEO, 0,
+                            makeVideoFrame(width, height, flags, avcc));
+        });
+    }];
     return YES;
 }
 

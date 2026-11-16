@@ -28,17 +28,17 @@ BOOL IOSPYH264Available(void);
 // NAL units); on a keyframe the SPS/PPS parameter sets are prepended (also AVCC
 // framed) so the host can build its decoder from the stream alone.
 //
-// Returns:
-//   nil          the session could not be created or the encode errored, so the
-//                caller should fall back to MJPEG.
-//   empty data   the frame was dropped by the encoder this tick (skip it).
-//   data         the encoded frame; *outKeyframe says whether it's a keyframe.
-- (NSData *)encodeSurface:(IOSurfaceRef)surface
-                    width:(int)width
-                   height:(int)height
-                      fps:(int)fps
-            forceKeyframe:(BOOL)forceKeyframe
-                 keyframe:(BOOL *)outKeyframe;
+// Asynchronous: the frame is queued and the method returns immediately. The
+// completion block is called once per submitted frame, on a VideoToolbox thread:
+//   failed == YES   session setup or encode failed; caller should fall back to MJPEG.
+//   failed == NO, avcc empty   the encoder dropped this tick (skip it).
+//   failed == NO, avcc data     the encoded frame; isKey says whether it's a keyframe.
+- (void)encodeSurface:(IOSurfaceRef)surface
+                 width:(int)width
+                height:(int)height
+                   fps:(int)fps
+         forceKeyframe:(BOOL)forceKeyframe
+            completion:(void (^)(NSData *avcc, BOOL isKey, BOOL failed))completion;
 
 // Tear down the underlying session (e.g. when the stream stops).
 - (void)invalidate;
