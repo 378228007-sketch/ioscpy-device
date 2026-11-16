@@ -84,8 +84,11 @@ static CFStringRef IOSPYVTPropKey(const char *symbolName) {
 
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+    // Main profile: CABAC entropy coding, ~10-15% better quality at the same
+    // bitrate than Baseline (which is CAVLC-only). Host FFmpeg H.264 decoder
+    // does not care about profile, so no client change is needed.
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_ProfileLevel,
-                         kVTProfileLevel_H264_Baseline_AutoLevel);
+                         kVTProfileLevel_H264_Main_AutoLevel);
 
     // Latency knobs: prefer encode speed over compression efficiency, and forbid
     // the encoder from holding frames back for lookahead/reordering. Both are
@@ -109,7 +112,7 @@ static CFStringRef IOSPYVTPropKey(const char *symbolName) {
 
     // Cap bandwidth. Raised with the 1600->1920 longest-side change: 1080p-class
     // screen content needs more headroom to stay clean during motion.
-    int avgBitrate = 12 * 1000 * 1000;
+    int avgBitrate = 16 * 1000 * 1000;
     [self setProp:kVTCompressionPropertyKey_AverageBitRate number:avgBitrate];
     int byteCap = (int)((double)avgBitrate / 8.0 * 1.5);
     NSArray *limits = @[ @(byteCap), @(1.0) ]; // bytes per 1-second window
