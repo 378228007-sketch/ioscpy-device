@@ -3,7 +3,6 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach/mach_time.h>
-
 // Private IOKit HID SPI, not in the public headers, so declared here. Touches are
 // synthesized as digitizer events and dispatched through the system HID client.
 // That only works from inside SpringBoard (the bundle identity is the
@@ -14,7 +13,6 @@ typedef uint32_t IOHIDEventField;
 typedef uint32_t IOOptionBits;
 typedef struct __IOHIDEvent *IOHIDEventRef;
 typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
-
 extern "C" {
 IOHIDEventRef IOHIDEventCreateDigitizerEvent(CFAllocatorRef allocator, uint64_t timeStamp,
                                              IOHIDDigitizerTransducerType type, uint32_t index,
@@ -35,7 +33,6 @@ void IOHIDEventSetFloatValue(IOHIDEventRef e, IOHIDEventField f, IOHIDFloat v);
 void IOHIDEventSetSenderID(IOHIDEventRef e, uint64_t senderID);
 uint64_t IOHIDEventGetSenderID(IOHIDEventRef e);
 uint32_t IOHIDEventGetType(IOHIDEventRef e);
-
 IOHIDEventRef IOHIDEventCreateKeyboardEvent(CFAllocatorRef allocator, uint64_t timeStamp,
                                             uint32_t usagePage, uint32_t usage, Boolean down,
                                             IOOptionBits options);
@@ -45,14 +42,12 @@ void IOHIDEventSystemClientScheduleWithRunLoop(IOHIDEventSystemClientRef, CFRunL
 void IOHIDEventSystemClientRegisterEventCallback(IOHIDEventSystemClientRef, void *cb, void *target,
                                                  void *refcon);
 }
-
 #define kIOHIDDigitizerEventRange 0x00000001u
 #define kIOHIDDigitizerEventTouch 0x00000002u
 #define kIOHIDDigitizerEventPosition 0x00000004u
 #define kIOHIDDigitizerEventIdentity 0x00000020u
 #define kIOHIDDigitizerTransducerTypeHand 3
 #define kIOHIDEventTypeDigitizer 11
-
 // Digitizer field selectors (same magic values long-used by touch tools).
 #define kFieldDigitizerIsDisplayInteg 0x000b0019
 #define kFieldDigitizerEventMask 0x000b0007
@@ -60,11 +55,9 @@ void IOHIDEventSystemClientRegisterEventCallback(IOHIDEventSystemClientRef, void
 #define kFieldDigitizerTouch 0x000b0009
 #define kFieldDigitizerMajorRadius 0x000b0014
 #define kFieldDigitizerMinorRadius 0x000b0015
-
 static uint64_t gSenderID = 0;
 static IOHIDEventSystemClientRef gClient = NULL;
 static IOHIDEventSystemClientRef gMonitor = NULL;
-
 // Learn the real digitizer sender id from the first physical touch. Some builds
 // drop injected events without it.
 static void senderCallback(void *target, void *refcon, void *service, IOHIDEventRef event) {
@@ -73,7 +66,6 @@ static void senderCallback(void *target, void *refcon, void *service, IOHIDEvent
         NSLog(@"[ioscpyhook] captured digitizer senderID 0x%llx", gSenderID);
     }
 }
-
 static void hidInit(void) {
     if (gClient) {
         return;
@@ -89,7 +81,6 @@ static void hidInit(void) {
         IOHIDEventSystemClientScheduleWithRunLoop(gMonitor, CFRunLoopGetMain(), kCFRunLoopDefaultMode);
     }
 }
-
 // Rotate a normalized point into the panel's native-portrait space. The digitizer
 // space does not rotate with the UI. orient: 1=portrait, 2=upsideDown,
 // 3=landscapeLeft, 4=landscapeRight.
@@ -103,12 +94,10 @@ static void rotatePoint(int orient, float nx, float ny, float *rx, float *ry) {
     *rx = fmaxf(0.0f, fminf(1.0f, *rx));
     *ry = fmaxf(0.0f, fminf(1.0f, *ry));
 }
-
 // Cached foreground-app orientation (1=portrait, 2=upsideDown, 3=landscapeLeft,
 // 4=landscapeRight). Updated on the main thread (UIApplication is main-only).
 // The off-main capture and touch paths just read this.
 static volatile int gOrientation = 1;
-
 // Map a UIInterfaceOrientation to our internal 1-4. Uses the enum constants so
 // it's correct regardless of their raw numeric values.
 static int mapInterfaceOrientation(NSInteger o) {
@@ -120,7 +109,6 @@ static int mapInterfaceOrientation(NSInteger o) {
         default:                                       return 1;
     }
 }
-
 // Read the frontmost app's interface orientation. Must run on the main thread.
 // activeInterfaceOrientation is SpringBoard's frontmost-app orientation across
 // the versions we target. Fall back to the status bar orientation, then portrait,
@@ -144,7 +132,6 @@ static int readForegroundOrientation(void) {
     }
     return 1;
 }
-
 void IOSPYOrientationStart(void) {
     static dispatch_source_t timer = NULL;
     static dispatch_once_t once;
@@ -165,45 +152,104 @@ void IOSPYOrientationStart(void) {
         dispatch_resume(timer);
     });
 }
-
 int IOSPYCurrentOrientation(void) {
     return gOrientation;
 }
-
 static int currentOrientation(void) {
     return gOrientation;
 }
 
-static int gTouchBalance = 0;
+// =====================================================================================
+// MULTI-FINGER INJECTION
+// -------------------------------------------------------------------------------------
+// iOS interprets ONE dispatched digitizer "hand" as the complete snapshot of the
+// fingers currently on the panel. Any finger that is NOT appended to that hand is
+// implicitly lifted. The original implementation created a brand-new hand per touch
+// message and appended only the finger that message mentioned, so a second finger
+// down silently cancelled the first one - the screen could never show two points.
+//
+// Fix: keep an active-finger table (id -> position) and append EVERY active finger
+// to every dispatched hand. The finger this message is about carries the real
+// event mask (down/up = range+touch, move = position); the others carry position
+// only so they stay down without re-announcing themselves.
+//
+// Second fix: the original 1.2 s safety net force-released a hardcoded finger id 0
+// with the last global coordinates, which killed a legitimately held steer-wheel
+// finger. It now releases only fingers that are actually still down, and each one
+// at its own position.
+// =====================================================================================
+#define IOSPY_MAX_FINGERS 10
+
+static bool     gFingerActive[IOSPY_MAX_FINGERS];
+static float    gFingerX[IOSPY_MAX_FINGERS];
+static float    gFingerY[IOSPY_MAX_FINGERS];
+static int      gFingerCount = 0;
 static uint64_t gTouchEpoch = 0;
-static float gLastX = 0.5f;
-static float gLastY = 0.5f;
+// Build marker: lets you confirm the running dylib is the multi-touch build
+// (`strings ioscpyhook.dylib | grep IOSCPY_MULTITOUCH`).
+static bool     gMTLogged = false;
+static const char *kIOSPYMTTag = "IOSCPY_MULTITOUCH_V1";
 
 void IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y) {
     hidInit();
     if (!gClient) {
         return;
     }
+    int idx = (int)fingerID;
+    if (idx < 0 || idx >= IOSPY_MAX_FINGERS) {
+        NSLog(@"[ioscpyhook] finger id %u out of table range", fingerID);
+        return;
+    }
 
-    gLastX = x;
-    gLastY = y;
+    // A repeated down for an already-held finger is the client's keep-alive
+    // re-assert (the 1.2 s safety net above). Treat it as a move so the digitizer
+    // does not see a second "touch begin" for the same finger.
+    if (phase == IOSPYTouchDown && gFingerActive[idx]) {
+        phase = IOSPYTouchMove;
+    }
+
     if (phase == IOSPYTouchDown) {
-        gTouchBalance++;
+        gFingerActive[idx] = true;
+        gFingerCount++;
         gTouchEpoch++;
-        // Safety net: if a swipe gets captured by a system edge gesture and no up
-        // arrives, force one so the digitizer can't get stuck.
+        // Safety net: nothing else down/up for 1.2 s means a system edge gesture
+        // probably swallowed the real up. Release everything that is still held,
+        // each at its own position (never a hardcoded id 0).
         uint64_t epoch = gTouchEpoch;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            if (gTouchBalance > 0 && gTouchEpoch == epoch) {
-                IOSPYInjectTouch(IOSPYTouchUp, 0, gLastX, gLastY);
+            if (gTouchEpoch == epoch && gFingerCount > 0) {
+                for (int i = 0; i < IOSPY_MAX_FINGERS; i++) {
+                    if (gFingerActive[i]) {
+                        IOSPYInjectTouch(IOSPYTouchUp, (uint8_t)i, gFingerX[i], gFingerY[i]);
+                    }
+                }
             }
         });
     } else if (phase == IOSPYTouchUp) {
-        if (gTouchBalance > 0) {
-            gTouchBalance--;
-        }
         gTouchEpoch++;
+        // Client keep-alive ping: it fires an up on a slot that was never pressed,
+        // purely to bump the watchdog epoch. Injecting it makes the digitizer report
+        // a finger leaving at that slot's coordinates - when those coordinates are
+        // the steer wheel, the game reads it as "stick let go" and re-centres.
+        // Bump the epoch and drop the event.
+        if (!gFingerActive[idx]) {
+            return;
+        }
+    } else {
+        if (!gFingerActive[idx]) {
+            // A move for a finger we never saw go down: adopt it rather than drop it.
+            gFingerActive[idx] = true;
+            gFingerCount++;
+        }
+    }
+
+    gFingerX[idx] = x;
+    gFingerY[idx] = y;
+
+    if (!gMTLogged && gFingerCount >= 2) {
+        gMTLogged = true;
+        NSLog(@"[ioscpyhook] %s active=%d", kIOSPYMTTag, gFingerCount);
     }
 
     float rx, ry;
@@ -212,27 +258,44 @@ void IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y)
     uint64_t ts = mach_absolute_time();
     Boolean touch = (phase != IOSPYTouchUp);
     Boolean range = touch;
-    uint32_t mask = (phase == IOSPYTouchMove)
-                        ? kIOHIDDigitizerEventPosition
-                        : (kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch);
+    uint32_t selfMask = (phase == IOSPYTouchMove)
+                            ? kIOHIDDigitizerEventPosition
+                            : (kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch);
 
     IOHIDEventRef parent = IOHIDEventCreateDigitizerEvent(
-        kCFAllocatorDefault, ts, kIOHIDDigitizerTransducerTypeHand, 0, 0, mask, 0, 0, 0, 0, 0, 0,
-        range, touch, 0);
+        kCFAllocatorDefault, ts, kIOHIDDigitizerTransducerTypeHand, 0, 0, selfMask, 0, 0, 0, 0, 0,
+        0, range, touch, 0);
     IOHIDEventSetIntegerValue(parent, kFieldDigitizerIsDisplayInteg, 1);
 
-    IOHIDEventRef finger = IOHIDEventCreateDigitizerFingerEvent(
-        kCFAllocatorDefault, ts, (uint32_t)fingerID, (uint32_t)fingerID + 1, mask,
+    // (1) The finger this message is about.
+    IOHIDEventRef mainFinger = IOHIDEventCreateDigitizerFingerEvent(
+        kCFAllocatorDefault, ts, (uint32_t)fingerID, (uint32_t)fingerID + 1, selfMask,
         (IOHIDFloat)rx, (IOHIDFloat)ry, 0, touch ? 1.0 : 0.0, 0, range, touch, 0);
-    IOHIDEventSetFloatValue(finger, kFieldDigitizerMajorRadius, 0.04f);
-    IOHIDEventSetFloatValue(finger, kFieldDigitizerMinorRadius, 0.04f);
+    IOHIDEventSetFloatValue(mainFinger, kFieldDigitizerMajorRadius, 0.04f);
+    IOHIDEventSetFloatValue(mainFinger, kFieldDigitizerMinorRadius, 0.04f);
+    IOHIDEventAppendEvent(parent, mainFinger);
+    CFRelease(mainFinger);
 
-    IOHIDEventAppendEvent(parent, finger);
-    // What this event reports. A down/up announces a finger arriving or leaving
+    // (2) Every other finger still down. Position-only keeps it alive and moves it,
+    //     without claiming a new touch-begin that would reset its gesture state.
+    for (int i = 0; i < IOSPY_MAX_FINGERS; i++) {
+        if (i == idx || !gFingerActive[i]) {
+            continue;
+        }
+        float orx, ory;
+        rotatePoint(currentOrientation(), gFingerX[i], gFingerY[i], &orx, &ory);
+        IOHIDEventRef other = IOHIDEventCreateDigitizerFingerEvent(
+            kCFAllocatorDefault, ts, (uint32_t)i, (uint32_t)i + 1,
+            kIOHIDDigitizerEventPosition, (IOHIDFloat)orx, (IOHIDFloat)ory, 0, 1.0, 0,
+            true, true, 0);
+        IOHIDEventSetFloatValue(other, kFieldDigitizerMajorRadius, 0.04f);
+        IOHIDEventSetFloatValue(other, kFieldDigitizerMinorRadius, 0.04f);
+        IOHIDEventAppendEvent(parent, other);
+        CFRelease(other);
+    }
+
+    // What this hand reports. A down/up announces a finger arriving or leaving
     // (range + touch, with its identity); a move announces a position change.
-    // Re-asserting range+touch on every move makes each one read as a fresh
-    // touch-begin, so a drag never coalesces into a continuous pan. Moves carry
-    // the position bit instead, which is what lets swipes and scrolls track.
     uint32_t parentMask = (phase == IOSPYTouchMove)
                               ? kIOHIDDigitizerEventPosition
                               : (kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch |
@@ -240,15 +303,19 @@ void IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y)
     IOHIDEventSetIntegerValue(parent, kFieldDigitizerEventMask, parentMask);
     IOHIDEventSetIntegerValue(parent, kFieldDigitizerRange, range ? 1 : 0);
     IOHIDEventSetIntegerValue(parent, kFieldDigitizerTouch, touch ? 1 : 0);
-
     if (gSenderID != 0) {
         IOHIDEventSetSenderID(parent, gSenderID);
     }
-
     IOHIDEventSystemClientDispatchEvent(gClient, parent);
-
-    CFRelease(finger);
     CFRelease(parent);
+
+    if (phase == IOSPYTouchUp && gFingerActive[idx]) {
+        gFingerActive[idx] = false;
+        gFingerCount--;
+        if (gFingerCount < 0) {
+            gFingerCount = 0;
+        }
+    }
 }
 
 // Press and release a HID button (e.g. the home button as consumer "menu").
@@ -270,13 +337,10 @@ static void injectButton(uint32_t usagePage, uint32_t usage) {
         CFRelease(e);
     }
 }
-
 // keyboard: HID keyboard page 0x07 routes to the foreground app's field
-
 #define kHIDPage_Keyboard 0x07
 #define kHIDUsage_LeftShift 0xE1
 #define kHIDUsage_LeftGUI 0xE3
-
 static void keyEvent(uint32_t usage, bool down) {
     hidInit();
     if (!gClient) {
@@ -292,7 +356,6 @@ static void keyEvent(uint32_t usage, bool down) {
     IOHIDEventSystemClientDispatchEvent(gClient, e);
     CFRelease(e);
 }
-
 // Press a key, optionally with Shift held, like a real keyboard chord.
 static void typeUsage(uint32_t usage, bool shift) {
     if (shift) {
@@ -304,7 +367,6 @@ static void typeUsage(uint32_t usage, bool shift) {
         keyEvent(kHIDUsage_LeftShift, false);
     }
 }
-
 // Press a key with Command held (the iOS editing shortcuts).
 static void cmdChord(uint32_t usage) {
     keyEvent(kHIDUsage_LeftGUI, true);
@@ -312,7 +374,6 @@ static void cmdChord(uint32_t usage) {
     keyEvent(usage, false);
     keyEvent(kHIDUsage_LeftGUI, false);
 }
-
 // Map a US-ASCII character to its HID keyboard usage and whether Shift is needed.
 static bool charToUsage(unichar c, uint32_t *usage, bool *shift) {
     *shift = false;
@@ -359,7 +420,6 @@ static bool charToUsage(unichar c, uint32_t *usage, bool *shift) {
         default: return false;
     }
 }
-
 void IOSPYTypeText(NSString *text) {
     if (text.length == 0) {
         return;
@@ -381,7 +441,6 @@ void IOSPYTypeText(NSString *text) {
         }
     });
 }
-
 void IOSPYKeyAction(uint8_t code) {
     dispatch_async(dispatch_get_main_queue(), ^{
         hidInit();
@@ -406,12 +465,9 @@ void IOSPYKeyAction(uint8_t code) {
         }
     });
 }
-
 // system actions (run in SpringBoard, main thread)
-
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-
 static id sharedOf(const char *cls) {
     Class c = objc_getClass(cls);
     if (!c) {
@@ -425,7 +481,6 @@ static id sharedOf(const char *cls) {
     }
     return nil;
 }
-
 // Close Control Center / Notification Center if they're showing. The HID home
 // button doesn't dismiss them on a no-home-button device.
 static void dismissOverlays(void) {
@@ -453,13 +508,11 @@ static void dismissOverlays(void) {
         }
     }
 }
-
 static void actionHome(void) {
     // Close any pulled-down overlay first, then go home.
     dismissOverlays();
     injectButton(0x0C, 0x40);
 }
-
 static void actionLock(void) {
     id mgr = sharedOf("SBLockScreenManager");
     if ([mgr respondsToSelector:@selector(lockUIFromSource:withOptions:)]) {
@@ -468,7 +521,6 @@ static void actionLock(void) {
         fn(mgr, @selector(lockUIFromSource:withOptions:), 1, nil);
     }
 }
-
 static void actionWake(void) {
     id bl = sharedOf("SBBacklightController");
     if ([bl respondsToSelector:@selector(turnOnScreenFullyWithBacklightSource:)]) {
@@ -481,7 +533,6 @@ static void actionWake(void) {
         fn(bl, @selector(setBacklightFactor:source:), 1.0f, 1);
     }
 }
-
 static void actionAppSwitcher(void) {
     // SpringBoard's own handler for the "open app switcher" hardware-keyboard
     // shortcut. Closest match to what we want and present across recent iOS
@@ -506,7 +557,6 @@ static void actionAppSwitcher(void) {
         [uic performSelector:@selector(_toggleSwitcher)];
     }
 }
-
 // "Back". Cmd+[ is the most reliable trigger: UIKit registers it as the
 // UINavigationController pop and WebKit/Safari as web-back, and it routes to the
 // focused foreground app like a real keyboard, so it works cross-process from
@@ -517,7 +567,6 @@ static void actionAppSwitcher(void) {
 static void actionBack(void) {
     cmdChord(0x2F); // Cmd+[
 }
-
 void IOSPYSystemAction(uint16_t action) {
     dispatch_async(dispatch_get_main_queue(), ^{
         switch (action) {
@@ -530,5 +579,4 @@ void IOSPYSystemAction(uint16_t action) {
         }
     });
 }
-
 #pragma clang diagnostic pop
