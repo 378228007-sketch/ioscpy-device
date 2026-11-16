@@ -15,7 +15,7 @@
 // Capture tuning. We aim high on rate and let the serial capture queue settle the
 // real fps to whatever the device can sustain. Longest side is capped for
 // bandwidth and CPU.
-static const CGFloat kMaxDimension = 1600.0;
+static const CGFloat kMaxDimension = 1920.0;   // 1600 -> 1920: full 1080p-class longest side
 static const CGFloat kQuality = 0.72;
 static const NSTimeInterval kInterval = 1.0 / 60.0;   // 45 -> 60 fps: shorter capture wait, the largest fixed latency term
 

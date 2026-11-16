@@ -107,8 +107,9 @@ static CFStringRef IOSPYVTPropKey(const char *symbolName) {
     [self setProp:kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration real:4.0];
     [self setProp:kVTCompressionPropertyKey_ExpectedFrameRate number:fps];
 
-    // Cap bandwidth well under the MJPEG path; screen content stays far below it.
-    int avgBitrate = 8 * 1000 * 1000;
+    // Cap bandwidth. Raised with the 1600->1920 longest-side change: 1080p-class
+    // screen content needs more headroom to stay clean during motion.
+    int avgBitrate = 12 * 1000 * 1000;
     [self setProp:kVTCompressionPropertyKey_AverageBitRate number:avgBitrate];
     int byteCap = (int)((double)avgBitrate / 8.0 * 1.5);
     NSArray *limits = @[ @(byteCap), @(1.0) ]; // bytes per 1-second window
