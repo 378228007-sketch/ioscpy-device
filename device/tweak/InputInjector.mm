@@ -185,6 +185,17 @@ static float    gFingerX[IOSPY_MAX_FINGERS];
 static float    gFingerY[IOSPY_MAX_FINGERS];
 static int      gFingerCount = 0;
 static uint64_t gTouchEpoch = 0;
+// 每根手指"最近一次事件"的时间戳（mach_absolute_time），静默看门狗用
+static uint64_t gFingerLastTs[IOSPY_MAX_FINGERS];
+// 客户端保活心跳（空闲槽上的纯 ping）最近一次时间
+static uint64_t gLastPingTs = 0;
+static bool     gWatchdogArmed = false;
+// 某根手指静默超过这么久 = 客户端发的那条 up 大概丢了，强制抬手
+static const double kFingerSilenceSec = 2.5;
+// 心跳超过这么久没来 = 客户端已经不认为自己还按着什么了
+static const double kPingSilenceSec = 2.0;
+static void ioscpyWatchdogArm(void);
+static void ioscpyWatchdogTick(void);
 // Build marker: lets you confirm the running dylib is the multi-touch build
 // (`strings ioscpyhook.dylib | grep IOSCPY_MULTITOUCH`).
 static bool     gMTLogged = false;
@@ -202,38 +213,33 @@ void IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y)
     }
 
     // A repeated down for an already-held finger is the client's keep-alive
-    // re-assert (the 1.2 s safety net above). Treat it as a move so the digitizer
-    // does not see a second "touch begin" for the same finger.
+    // re-assert. Treat it as a move so the digitizer does not see a second
+    // "touch begin" for the same finger.
     if (phase == IOSPYTouchDown && gFingerActive[idx]) {
         phase = IOSPYTouchMove;
     }
+
+    // 每次事件都刷新这根手指的"最近活跃"时间，静默看门狗据此判断它是不是还活着
+    gFingerLastTs[idx] = mach_absolute_time();
 
     if (phase == IOSPYTouchDown) {
         gFingerActive[idx] = true;
         gFingerCount++;
         gTouchEpoch++;
-        // Safety net: nothing else down/up for 1.2 s means a system edge gesture
-        // probably swallowed the real up. Release everything that is still held,
-        // each at its own position (never a hardcoded id 0).
-        uint64_t epoch = gTouchEpoch;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (gTouchEpoch == epoch && gFingerCount > 0) {
-                for (int i = 0; i < IOSPY_MAX_FINGERS; i++) {
-                    if (gFingerActive[i]) {
-                        IOSPYInjectTouch(IOSPYTouchUp, (uint8_t)i, gFingerX[i], gFingerY[i]);
-                    }
-                }
-            }
-        });
+        // 旧版这里是"全局 epoch 1.2s 一刀切"兜底。它有个致命缺点：客户端保活心跳
+        // 每 900ms 推一次 epoch，兜底就永远不会再触发；于是只要有一次 up 丢了，
+        // 手指就会一直按着（表现就是方向轮卡在一个方向、松手后角色还在走）。
+        // 改成按手指静默超时，见 ioscpyWatchdogTick。
+        ioscpyWatchdogArm();
     } else if (phase == IOSPYTouchUp) {
         gTouchEpoch++;
         // Client keep-alive ping: it fires an up on a slot that was never pressed,
-        // purely to bump the watchdog epoch. Injecting it makes the digitizer report
-        // a finger leaving at that slot's coordinates - when those coordinates are
-        // the steer wheel, the game reads it as "stick let go" and re-centres.
-        // Bump the epoch and drop the event.
+        // purely to bump the epoch. Injecting it makes the digitizer report a finger
+        // leaving at that slot's coordinates - when those coordinates are the steer
+        // wheel, the game reads it as "stick let go" and re-centres.
+        // Bump the epoch, record the heartbeat, and drop the event.
         if (!gFingerActive[idx]) {
+            gLastPingTs = mach_absolute_time();
             return;
         }
     } else {
@@ -258,13 +264,28 @@ void IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y)
     uint64_t ts = mach_absolute_time();
     Boolean touch = (phase != IOSPYTouchUp);
     Boolean range = touch;
+    // 抬手一根手指 ≠ 整只手离场。别的手指还按着时，hand 级的 Range/Touch 必须保持 1，
+    // 否则系统只看 hand 的 range=0，会把其余手指一起结束掉（多指时松开一个键，
+    // 摇杆/开火会被连带松开）。只有最后一根手指抬起时 hand 级才归 0。
+    Boolean handTouch = touch;
+    Boolean handRange = range;
+    if (phase == IOSPYTouchUp) {
+        int stillDown = 0;
+        for (int i = 0; i < IOSPY_MAX_FINGERS; i++) {
+            if (i != idx && gFingerActive[i]) {
+                stillDown++;
+            }
+        }
+        handTouch = (stillDown > 0);
+        handRange = handTouch;
+    }
     uint32_t selfMask = (phase == IOSPYTouchMove)
                             ? kIOHIDDigitizerEventPosition
                             : (kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch);
 
     IOHIDEventRef parent = IOHIDEventCreateDigitizerEvent(
         kCFAllocatorDefault, ts, kIOHIDDigitizerTransducerTypeHand, 0, 0, selfMask, 0, 0, 0, 0, 0,
-        0, range, touch, 0);
+        0, handRange, handTouch, 0);
     IOHIDEventSetIntegerValue(parent, kFieldDigitizerIsDisplayInteg, 1);
 
     // (1) The finger this message is about.
@@ -301,8 +322,8 @@ void IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y)
                               : (kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch |
                                  kIOHIDDigitizerEventIdentity);
     IOHIDEventSetIntegerValue(parent, kFieldDigitizerEventMask, parentMask);
-    IOHIDEventSetIntegerValue(parent, kFieldDigitizerRange, range ? 1 : 0);
-    IOHIDEventSetIntegerValue(parent, kFieldDigitizerTouch, touch ? 1 : 0);
+    IOHIDEventSetIntegerValue(parent, kFieldDigitizerRange, handRange ? 1 : 0);
+    IOHIDEventSetIntegerValue(parent, kFieldDigitizerTouch, handTouch ? 1 : 0);
     if (gSenderID != 0) {
         IOHIDEventSetSenderID(parent, gSenderID);
     }
@@ -315,6 +336,57 @@ void IOSPYInjectTouch(IOSPYTouchPhase phase, uint8_t fingerID, float x, float y)
         if (gFingerCount < 0) {
             gFingerCount = 0;
         }
+    }
+}
+
+// ---------- 静默看门狗 ----------
+// 目的：手指只要还在被客户端"喂"着（DOWN/UP/保活 MOVE/心跳 ping 任意一种），就一直按住；
+// 一旦客户端彻底安静了（up 丢了、客户端崩了、切前台事件没送达），就把还按着的手指
+// 逐个抬起，避免"方向轮卡死在一个方向、松手后角色还在走"。
+static void ioscpyWatchdogArm(void) {
+    if (gWatchdogArmed) {
+        return;
+    }
+    gWatchdogArmed = true;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        ioscpyWatchdogTick();
+    });
+}
+
+static void ioscpyWatchdogTick(void) {
+    gWatchdogArmed = false;
+    if (gFingerCount <= 0) {
+        return;
+    }
+    static mach_timebase_info_data_t tb = {0, 0};
+    if (tb.denom == 0) {
+        mach_timebase_info(&tb);
+    }
+    if (tb.denom == 0) {
+        return;
+    }
+    const uint64_t now = mach_absolute_time();
+    const double nsPerTick = (double)tb.numer / (double)tb.denom;
+    // 心跳还新：客户端明确认为自己还按着东西（左键长按这类"位置不能动"的保持，
+    // 客户端只能靠心跳表示还活着），此时不要动任何手指。
+    const bool pingFresh = (gLastPingTs != 0)
+                           && ((double)(now - gLastPingTs) * nsPerTick / 1e9 < kPingSilenceSec);
+    bool stillDown = false;
+    for (int i = 0; i < IOSPY_MAX_FINGERS; i++) {
+        if (!gFingerActive[i]) {
+            continue;
+        }
+        const double age = (double)(now - gFingerLastTs[i]) * nsPerTick / 1e9;
+        if (!pingFresh && age > kFingerSilenceSec) {
+            NSLog(@"[ioscpyhook] watchdog release silent finger %d (%.2fs)", i, age);
+            IOSPYInjectTouch(IOSPYTouchUp, (uint8_t)i, gFingerX[i], gFingerY[i]);
+            continue;
+        }
+        stillDown = true;
+    }
+    if (stillDown) {
+        ioscpyWatchdogArm();
     }
 }
 
