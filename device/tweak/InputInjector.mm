@@ -194,6 +194,12 @@ static bool     gWatchdogArmed = false;
 static const double kFingerSilenceSec = 2.5;
 // 心跳超过这么久没来 = 客户端已经不认为自己还按着什么了
 static const double kPingSilenceSec = 2.0;
+// 心跳再新也不能无限期豁免某一根手指：当另一根手指还按着时（比如左键长按），
+// 保活心跳会让 pingFresh 一直是真，于是"丢了 up 的那根"就永远清不掉 ——
+// 表现就是方向轮一直按死在一个方向、松手后角色还在走。
+// 真正按住的手指每 ≤900ms 都会被客户端的保活 MOVE 刷新一次，
+// 所以静默超过这个值只可能是 up 丢了，直接抬。
+static const double kFingerHardCapSec = 4.0;
 static void ioscpyWatchdogArm(void);
 static void ioscpyWatchdogTick(void);
 // Build marker: lets you confirm the running dylib is the multi-touch build
@@ -378,7 +384,8 @@ static void ioscpyWatchdogTick(void) {
             continue;
         }
         const double age = (double)(now - gFingerLastTs[i]) * nsPerTick / 1e9;
-        if (!pingFresh && age > kFingerSilenceSec) {
+        const bool silent = (!pingFresh && age > kFingerSilenceSec) || (age > kFingerHardCapSec);
+        if (silent) {
             NSLog(@"[ioscpyhook] watchdog release silent finger %d (%.2fs)", i, age);
             IOSPYInjectTouch(IOSPYTouchUp, (uint8_t)i, gFingerX[i], gFingerY[i]);
             continue;
